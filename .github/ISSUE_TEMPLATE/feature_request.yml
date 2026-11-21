@@ -1,0 +1,21 @@
+name: Feature request
+description: Something the tool should do and doesn't
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The situation, not just the proposed solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like
+      description: For example the command line or profile syntax you have in mind.
+  - type: textarea
+    id: sysfs
+    attributes:
+      label: Kernel interface
+      description: If you know which sysfs files are involved, name them. The tool only writes to files the kernel already exposes.

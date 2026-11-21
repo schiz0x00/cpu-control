@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # One grouped pull request a month, so the large GUI dependency tree
+  # does not turn into a stream of single-crate bumps.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

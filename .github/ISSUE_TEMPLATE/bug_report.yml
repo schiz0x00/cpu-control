@@ -1,0 +1,61 @@
+name: Bug report
+description: Something the tool did wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a security problem, do not file an issue: use the "Report a vulnerability" button under the Security tab.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what it did, and what you expected instead. Paste the exact command and its full output.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `cpu-control status`
+      description: Read-only, needs no root. If the problem involves offline CPUs, run it in the state where the problem shows.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU model
+      description: "`grep -m1 'model name' /proc/cpuinfo`"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel and distribution
+      description: "`uname -r`, and the distribution name and version"
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: cpufreq driver
+      description: "`cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver`"
+  - type: input
+    id: commit
+    attributes:
+      label: cpu-control commit
+      description: "`git rev-parse --short HEAD` in the checkout you built"
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How was it run
+      options:
+        - sudo (command line or TUI)
+        - GUI as a normal user (pkexec prompt)
+        - GUI started as root
+        - without root (read-only or dry run)
+    validations:
+      required: true

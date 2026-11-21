@@ -1,0 +1,44 @@
+name: Hardware report
+description: Tell us how it behaves on your CPU, working or not
+labels: [hardware-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The tool has been used on one machine (Intel Core Ultra 7 155H). A report from any other CPU is useful, including "everything looks right". The commands below are read-only and need no root.
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU model
+      description: "`grep -m1 'model name' /proc/cpuinfo`"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel, distribution and cpufreq driver
+      description: "`uname -r`, the distribution, and `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver`"
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `cpu-control status`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: selectors
+    attributes:
+      label: Selectors
+      description: "Output of `for s in p e lpe smt primary; do echo \"$s: $(cpu-control select $s)\"; done`"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: correct
+    attributes:
+      label: Is it right?
+      description: Are the core types, cores, SMT threads and L2 clusters what your CPU really has? If you also tried taking CPUs offline or tuning, say what you ran and what happened.
+    validations:
+      required: true
