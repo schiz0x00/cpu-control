@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v7
       # Pinned so a new clippy release cannot fail the build on its own;
       # bump it together with any fixes the new lints ask for.
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
