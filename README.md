@@ -1,9 +1,15 @@
 # cpu-control
 
 [![CI](https://github.com/schiz0x00/cpu-control/actions/workflows/ci.yml/badge.svg)](https://github.com/schiz0x00/cpu-control/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 A Linux tool that takes CPU threads offline and brings them back, and sets cpufreq limits, by writing to
 `/sys/devices/system/cpu`. It has a command line, a terminal UI and a desktop GUI over the same code.
+
+![The GUI: core cards grouped by type, with one P-core staged to go offline](docs/gui.png)
+
+*The GUI in dry-run mode, showing the development machine's CPUs with one P-core (threads 6 and 7) staged
+to go offline. Captured on a virtual display with software rendering.*
 
 It adds no capability the kernel doesn't already expose: everything it does can be done with `echo` into
 sysfs as root. What it adds is convenience on hybrid Intel CPUs:
@@ -30,7 +36,9 @@ Read this before relying on it.
   `cpu_core` / `cpu_atom` PMU lists. LP-E is taken from a `cpu_lowpower` list if the kernel has one,
   otherwise it is "an atom core with no L3 cache". That is right on the 155H; on other generations it may
   label ordinary E-cores as LP-E.
-- **No license has been chosen yet.** See [License](#license).
+
+If you run it on anything else, a [hardware report](https://github.com/schiz0x00/cpu-control/issues/new?template=hardware_report.yml)
+saying whether it got your CPU right is the most useful contribution there is.
 
 What it is not: it is not a daemon, it keeps nothing across a reboot, and it does not manage process
 affinity, cgroups or scheduling. Other power managers (power-profiles-daemon, TLP, tuned and the like)
@@ -228,6 +236,8 @@ and `smt` treat it as a P-core with a single thread, and `core:N` does not match
 - Under `sudo`, the invoking user's home is looked up in `/etc/passwd` only (no LDAP or systemd-homed).
 - After a failed write, the CLI prints both a `did:` line and a `failed:` line for that action.
 - `cpu-control status | head` can end with a broken-pipe panic.
+- The GUI's whole-core toggle is the `⏻` symbol, which the GUI toolkit's built-in fonts lack. It is drawn
+  from a system font (Noto Sans Symbols 2, for example) and shows as an empty box if none has it.
 
 ## Tests
 
@@ -235,7 +245,7 @@ and `smt` treat it as a P-core with a single thread, and `core:N` does not match
 cargo test
 ```
 
-At the time of writing that is 161 unit tests and 33 end-to-end tests that run the built binary. All of
+At the time of writing that is 162 unit tests and 33 end-to-end tests that run the built binary. All of
 them work on a simulated sysfs tree in a temp directory (`tests/support/sysfs_tree.rs`, modelled on the
 155H) and never touch the real `/sys`, your profiles or the topology cache. The simulation also performs
 the kernel's side effects of taking a CPU offline. Those were checked against the kernel source
@@ -253,7 +263,24 @@ What the tests do not cover:
 
 CI runs `cargo clippy -- -D warnings` and `cargo test` on Ubuntu with a pinned Rust version.
 
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). This is a personal project
+maintained in spare time, so there is no promised response time. Changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
+
+Because the tool runs as root, please report security problems privately as described in
+[SECURITY.md](SECURITY.md) rather than in a public issue.
+
 ## License
 
-No license has been chosen yet. Until one is added, normal copyright applies: you can read the code, but
-you have no grant to use, modify or redistribute it.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Both come without warranty of any kind; see the license texts.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this
+project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
