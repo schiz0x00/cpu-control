@@ -17,3 +17,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # Its refs are Rust version numbers, not releases of the action. The
+      # pinned toolchain in ci.yml is raised by hand, with any clippy fixes.
+      - dependency-name: dtolnay/rust-toolchain
