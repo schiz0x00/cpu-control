@@ -68,6 +68,10 @@ struct Gui {
     log: Vec<String>,
     last_refresh: Instant,
     job: Option<Job>,
+    /// Where each thread button was drawn in the last frame, with the clip
+    /// rectangle in force: `(cpu, button, clip)`. Lets tests check the layout.
+    #[cfg(test)]
+    drawn: std::cell::RefCell<Vec<(usize, egui::Rect, egui::Rect)>>,
 }
 
 pub fn run(ctx: Ctx, topo: Topology, globals: Globals) -> Result<()> {
@@ -81,6 +85,13 @@ pub fn run(ctx: Ctx, topo: Topology, globals: Globals) -> Result<()> {
     }
     eframe::run_native("CPU Control", opts, Box::new(|_| Ok(Box::new(gui)))).map_err(|e| anyhow::anyhow!("{e}"))
 }
+
+/// Minimum size of a thread button.
+const THREAD_BUTTON: Vec2 = Vec2::new(66.0, 34.0);
+/// Room a core card's header ("core N" and its toggle) may need.
+const CARD_HEADER_WIDTH: f32 = 70.0;
+/// A card's frame around its content: margins and outline on both sides.
+const CARD_PADDING: f32 = 16.0;
 
 fn kind_color(k: CoreKind) -> Color32 {
     match k {
@@ -113,6 +124,8 @@ impl Gui {
             log,
             last_refresh: Instant::now(),
             job: None,
+            #[cfg(test)]
+            drawn: Default::default(),
             ctx,
         }
     }
@@ -588,7 +601,9 @@ impl Gui {
     fn core_grid(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         egui::CentralPanel::default().show(ui, |ui| {
             // Scope selector lives here so it can mutate `self.scope` directly.
-            ui.horizontal(|ui| {
+            // Wrapped: a row wider than the panel would stretch everything
+            // below it past the visible edge.
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Tune scope:");
                 ui.selectable_value(&mut self.scope, Scope::Cpu, "this CPU");
                 ui.selectable_value(&mut self.scope, Scope::Core, "its core");
@@ -619,7 +634,7 @@ impl Gui {
             CoreKind::LpE => "Low-power efficiency cores",
         };
         let on = set.intersection(&self.desired).len();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(name).heading().color(color));
             ui.label(RichText::new(format!("{on}/{} on", set.len())).weak());
             if ui.button(if on == set.len() { "Disable all" } else { "Enable all" }).clicked() {
@@ -640,23 +655,34 @@ impl Gui {
             cores.entry(c.siblings.iter().next().unwrap_or(id)).or_default().push(id);
         }
 
-        ui.horizontal_wrapped(|ui| {
+        // Top-aligned rows: the default centred alignment would place each
+        // card relative to a row height that grows as cards are added.
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true), |ui| {
             for ids in cores.into_values() {
                 let core_set: CpuSet = ids.iter().copied().collect();
                 let first = self.topo.get(ids[0]).unwrap();
                 let core_id = if first.topology_known { first.core_id.to_string() } else { "?".to_string() };
-                egui::Frame::group(ui.style()).stroke(Stroke::new(1.0, color.gamma_multiply(0.5))).show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("core {core_id}")).small().weak());
-                            if ui.small_button("⏻").on_hover_text("toggle this whole core").clicked() {
-                                acts.push(Act::ToggleGroup(core_set.clone(), format!("core {core_id}")));
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            for id in &ids {
-                                self.cpu_button(ui, *id, acts);
-                            }
+                // A frame takes whatever is left of the row and never wraps on
+                // its own, so a card that does not fit would run off the edge.
+                // Reserving its width first (rounded up a little) makes the
+                // row break before the card instead.
+                let threads = ids.len() as f32;
+                let buttons = threads * THREAD_BUTTON.x + (threads - 1.0) * ui.spacing().item_spacing.x;
+                let card_width = buttons.max(CARD_HEADER_WIDTH) + CARD_PADDING;
+                ui.allocate_ui(Vec2::new(card_width, 0.0), |ui| {
+                    egui::Frame::group(ui.style()).stroke(Stroke::new(1.0, color.gamma_multiply(0.5))).show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("core {core_id}")).small().weak());
+                                if ui.small_button("⏻").on_hover_text("toggle this whole core").clicked() {
+                                    acts.push(Act::ToggleGroup(core_set.clone(), format!("core {core_id}")));
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                for id in &ids {
+                                    self.cpu_button(ui, *id, acts);
+                                }
+                            });
                         });
                     });
                 });
@@ -686,7 +712,9 @@ impl Gui {
         let freq = if c.online { c.cur_khz.map(fmt_khz).unwrap_or_default() } else { "off".into() };
         ui.vertical(|ui| {
             let label = RichText::new(format!("{id}")).strong().size(16.0).color(if want { Color32::WHITE } else { Color32::GRAY });
-            let resp = ui.add(egui::Button::new(label).fill(fill).stroke(stroke).min_size(Vec2::new(66.0, 34.0)));
+            let resp = ui.add(egui::Button::new(label).fill(fill).stroke(stroke).min_size(THREAD_BUTTON));
+            #[cfg(test)]
+            self.drawn.borrow_mut().push((id, resp.rect, ui.clip_rect()));
             if resp.clicked() {
                 acts.push(Act::Select(id));
                 acts.push(Act::ToggleGroup([id].into_iter().collect(), format!("cpu{id}")));
@@ -750,6 +778,51 @@ mod tests {
         let ctx = egui::Context::default();
         // No renderer here, so the font texture update is discarded on purpose.
         ctx.run_ui(egui::RawInput::default(), |ui| g.frame(ui)).drop_without_applying_deltas();
+    }
+
+    /// Render in a window of the given size, enough frames for the layout to settle.
+    fn draw_at(g: &mut Gui, width: f32, height: f32) {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            g.drawn.borrow_mut().clear();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, height))),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| g.frame(ui)).drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn every_thread_button_is_within_the_window_at_any_width() {
+        // Core cards have to wrap onto further rows; a card pushed past the
+        // right edge is clipped away and cannot be reached (the grid only
+        // scrolls vertically). 1100 is the default window width, 760 the minimum.
+        let (_f, mut g) = setup(true);
+        for width in [1100.0, 760.0, 900.0, 1600.0] {
+            draw_at(&mut g, width, 720.0);
+            let drawn = g.drawn.borrow();
+            assert_eq!(drawn.iter().map(|d| d.0).collect::<CpuSet>(), cpus("0-21"), "at width {width}");
+            for (id, button, clip) in drawn.iter() {
+                assert!(
+                    button.left() >= clip.left() && button.right() <= clip.right(),
+                    "cpu{id} is cut off at window width {width}: button x {}..{}, visible x {}..{}",
+                    button.left(),
+                    button.right(),
+                    clip.left(),
+                    clip.right()
+                );
+            }
+            // Cards form straight rows: two buttons that overlap vertically
+            // sit at exactly the same height (no staircase within a row).
+            for (a, ra, _) in drawn.iter() {
+                for (b, rb, _) in drawn.iter() {
+                    if ra.top() < rb.bottom() && rb.top() < ra.bottom() {
+                        assert!((ra.top() - rb.top()).abs() < 0.5, "cpu{a} and cpu{b} are misaligned at width {width}: y {} vs {}", ra.top(), rb.top());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
