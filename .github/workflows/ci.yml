@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned so a new clippy release cannot fail the build on its own;
+      # bump it together with any fixes the new lints ask for.
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # The tests run against a fake sysfs tree in a temp directory; they
+      # need no privileges and never touch the runner's real /sys.
+      - run: cargo test --locked

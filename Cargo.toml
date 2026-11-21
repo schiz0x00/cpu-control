@@ -2,6 +2,13 @@
 name = "cpu-control"
 version = "0.1.0"
 edition = "2024"
+# The GUI dependency (eframe 0.37) sets the floor; 1.96 and 1.99 are what has actually been run.
+rust-version = "1.95"
+description = "Take CPU threads and core groups offline and tune cpufreq on Linux, via sysfs (CLI, TUI and GUI)"
+repository = "https://github.com/schiz0x00/cpu-control"
+readme = "README.md"
+keywords = ["cpu", "linux", "sysfs", "hotplug", "cpufreq"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
 anyhow = "1.0.104"
