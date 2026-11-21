@@ -1,5 +1,6 @@
 mod ctx;
 mod cpuset;
+mod fsutil;
 mod gui;
 #[cfg(test)]
 mod fake;

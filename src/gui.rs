@@ -8,9 +8,11 @@ use crate::ctx::{self, Ctx};
 use crate::plan::fmt_khz;
 use crate::profile::{self, Profile, ProfileFile, TuneEntry};
 use crate::topology::{CoreKind, Cpu, Globals, Topology};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -49,7 +51,7 @@ enum Act {
 
 struct Job {
     rx: Receiver<Result<(i32, String), String>>,
-    tmp: std::path::PathBuf,
+    tmp: PathBuf,
 }
 
 struct Gui {
@@ -73,39 +75,11 @@ pub fn run(ctx: Ctx, topo: Topology, globals: Globals) -> Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]).with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
-    let mut log = Vec::new();
-    if ctx.dry_run {
-        log.push("DRY RUN: nothing will be written".to_string());
-    } else if !ctx::is_root() {
-        log.push("Not root: Apply will ask for authentication via pkexec".to_string());
+    let mut gui = Gui::new(ctx, topo, globals);
+    if !gui.ctx.dry_run && !ctx::is_root() {
+        gui.say("Not root: Apply will ask for authentication via pkexec");
     }
-    let gui = Gui {
-        desired: topo.online(),
-        selected: topo.cpus.first().map_or(0, |c| c.id),
-        topo,
-        globals,
-        turbo: None,
-        staged: BTreeMap::new(),
-        preset: None,
-        presets: load_presets(&ctx),
-        scope: Scope::Core,
-        log,
-        last_refresh: Instant::now(),
-        job: None,
-        ctx,
-    };
     eframe::run_native("CPU Control", opts, Box::new(|_| Ok(Box::new(gui)))).map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-fn load_presets(ctx: &Ctx) -> Vec<(String, Profile)> {
-    let file = ProfileFile::load(&ctx.profiles_path).unwrap_or_default();
-    let mut v: Vec<_> = profile::builtin()
-        .into_iter()
-        .filter(|(n, _)| !file.profile.contains_key(*n))
-        .map(|(n, p)| (n.to_string(), p))
-        .collect();
-    v.extend(file.profile);
-    v
 }
 
 fn kind_color(k: CoreKind) -> Color32 {
@@ -117,6 +91,32 @@ fn kind_color(k: CoreKind) -> Color32 {
 }
 
 impl Gui {
+    fn new(ctx: Ctx, topo: Topology, globals: Globals) -> Gui {
+        let mut log = Vec::new();
+        if ctx.dry_run {
+            log.push("DRY RUN: nothing will be written".to_string());
+        }
+        let file = ProfileFile::load(&ctx.profiles_path).unwrap_or_else(|e| {
+            log.push(format!("saved profiles unavailable ({e:#}); showing built-in presets only"));
+            ProfileFile::default()
+        });
+        Gui {
+            desired: topo.online(),
+            selected: topo.cpus.first().map_or(0, |c| c.id),
+            topo,
+            globals,
+            turbo: None,
+            staged: BTreeMap::new(),
+            preset: None,
+            presets: profile::available(file),
+            scope: Scope::Core,
+            log,
+            last_refresh: Instant::now(),
+            job: None,
+            ctx,
+        }
+    }
+
     fn dirty(&self) -> bool {
         self.desired != self.topo.online() || self.turbo.is_some() || !self.staged.is_empty() || self.preset.is_some()
     }
@@ -150,7 +150,8 @@ impl Gui {
         let Some(sel) = self.topo.get(self.selected) else { return CpuSet::new() };
         let set: CpuSet = match scope {
             Scope::Cpu => [sel.id].into_iter().collect(),
-            Scope::Core => self.topo.cpus.iter().filter(|c| c.package == sel.package && c.core_id == sel.core_id).map(|c| c.id).collect(),
+            // The physical core; just this CPU while its topology is unknown.
+            Scope::Core => sel.siblings.clone(),
             Scope::Kind => self.topo.of_kind(sel.kind),
             Scope::All => self.topo.all(),
         };
@@ -222,7 +223,8 @@ impl Gui {
             Act::SetFreq { min_khz, max_khz } => {
                 for id in self.scope_set(self.scope).iter() {
                     let Some(c) = self.topo.get(id) else { continue };
-                    let (lo, hi) = (c.min_khz.unwrap_or(0), c.max_khz.unwrap_or(u64::MAX));
+                    let lo = c.min_khz.unwrap_or(0);
+                    let hi = c.max_khz.unwrap_or(u64::MAX).max(lo);
                     let s = self.staged.entry(id).or_default();
                     // Always stage both ends so the pair stays consistent.
                     s.min_khz = Some(min_khz.clamp(lo, hi));
@@ -280,49 +282,20 @@ impl Gui {
         }
         let p = self.build_profile();
         if self.ctx.dry_run || ctx::is_root() {
-            let res = profile::to_request(&self.topo, &p).and_then(|req| self.ctx.execute(&self.topo, &req));
-            match res {
-                Ok(o) => {
-                    for w in &o.warnings {
-                        self.say(format!("warning: {w}"));
-                    }
-                    for a in &o.actions {
-                        self.say(format!("{}: {a}", if o.dry_run { "would" } else { "did" }));
-                    }
-                    for f in &o.failures {
-                        self.say(format!("FAILED: {f}"));
-                    }
-                    if !o.dry_run {
-                        self.say(format!("{} applied, {} failed", o.applied, o.failures.len()));
-                        self.refresh();
-                        if o.failures.is_empty() {
-                            self.discard();
-                        }
-                    }
-                }
-                Err(e) => self.say(format!("error: {e:#}")),
-            }
-            return;
+            return self.apply_direct(&p);
         }
         // Unprivileged: hand the staged profile to pkexec.
-        let mut file = ProfileFile::default();
-        file.profile.insert(STAGED_NAME.into(), p);
-        let tmp = std::env::temp_dir().join(format!("cpu-control-{}-{}.toml", std::process::id(), self.log.len()));
-        let written = toml::to_string_pretty(&file).map_err(anyhow::Error::from).and_then(|s| {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-            f.write_all(s.as_bytes())?;
-            Ok(())
-        });
-        if let Err(e) = written {
-            self.say(format!("could not write staged profile: {e}"));
-            return;
-        }
         let exe = match std::env::current_exe() {
             Ok(e) => e,
             Err(e) => {
                 self.say(format!("cannot locate own executable: {e}"));
+                return;
+            }
+        };
+        let tmp = match write_staged(p) {
+            Ok(t) => t,
+            Err(e) => {
+                self.say(format!("could not write staged profile: {e:#}"));
                 return;
             }
         };
@@ -345,6 +318,32 @@ impl Gui {
         });
         self.say("Waiting for authentication...");
         self.job = Some(Job { rx, tmp });
+    }
+
+    /// Apply in this process: we are root, or it is a dry run.
+    fn apply_direct(&mut self, p: &Profile) {
+        let res = profile::to_request(&self.topo, p).and_then(|req| self.ctx.execute(&self.topo, &req));
+        match res {
+            Ok(o) => {
+                for w in &o.warnings {
+                    self.say(format!("warning: {w}"));
+                }
+                for a in &o.actions {
+                    self.say(format!("{}: {a}", if o.dry_run { "would" } else { "did" }));
+                }
+                for f in &o.failures {
+                    self.say(format!("FAILED: {f}"));
+                }
+                if !o.dry_run {
+                    self.say(format!("{} applied, {} failed", o.applied, o.failures.len()));
+                    self.refresh();
+                    if o.failures.is_empty() {
+                        self.discard();
+                    }
+                }
+            }
+            Err(e) => self.say(format!("error: {e:#}")),
+        }
     }
 
     fn poll_job(&mut self, egui_ctx: &egui::Context) {
@@ -381,6 +380,38 @@ impl Gui {
 
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+}
+
+/// Write the staged profile where the privileged helper can read it: a fresh
+/// file only we can write, so what gets authenticated is what gets applied.
+fn write_staged(p: Profile) -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let mut file = ProfileFile::default();
+    file.profile.insert(STAGED_NAME.into(), p);
+    let text = toml::to_string_pretty(&file)?;
+    let name = format!("cpu-control-{}-{}.toml", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+    let tmp = std::env::temp_dir().join(name);
+    // `create_new` refuses an existing file or a symlink planted at this name.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    if let Err(e) = f.write_all(text.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    Ok(tmp)
+}
+
+impl Gui {
+    /// One frame of the whole window.
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let egui_ctx = ui.ctx().clone();
         self.poll_job(&egui_ctx);
         if self.job.is_none() && self.last_refresh.elapsed() > Duration::from_secs(1) {
@@ -397,9 +428,7 @@ impl eframe::App for Gui {
             self.handle(a);
         }
     }
-}
 
-impl Gui {
     fn top_bar(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
@@ -474,11 +503,16 @@ impl Gui {
             ui.add_space(6.0);
             let Some(cpu) = self.topo.get(self.selected) else { return };
             ui.heading(format!("cpu{}", cpu.id));
+            let (kind, core) = if cpu.topology_known {
+                (cpu.kind.to_string(), cpu.core_id.to_string())
+            } else {
+                ("unknown".to_string(), "?".to_string())
+            };
             ui.label(
                 RichText::new(format!(
                     "{} core · core_id {} · L2 #{} · {}",
-                    cpu.kind,
-                    cpu.core_id,
+                    kind,
+                    core,
                     cpu.l2_group.iter().next().unwrap_or(0),
                     if cpu.online { "online" } else { "offline" }
                 ))
@@ -597,19 +631,20 @@ impl Gui {
             }
         });
 
-        // Group threads into physical cores, ordered by lowest CPU id.
-        let mut cores: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+        // Group threads into physical cores (keyed, and so ordered, by the
+        // core's lowest CPU id). Sibling sets are used rather than core_id,
+        // which is only a placeholder for a CPU whose topology is unknown.
+        let mut cores: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for id in set.iter() {
             let c = self.topo.get(id).unwrap();
-            cores.entry((c.package, c.core_id)).or_default().push(id);
+            cores.entry(c.siblings.iter().next().unwrap_or(id)).or_default().push(id);
         }
-        let mut cores: Vec<Vec<usize>> = cores.into_values().collect();
-        cores.sort_by_key(|v| v[0]);
 
         ui.horizontal_wrapped(|ui| {
-            for ids in cores {
+            for ids in cores.into_values() {
                 let core_set: CpuSet = ids.iter().copied().collect();
-                let core_id = self.topo.get(ids[0]).unwrap().core_id;
+                let first = self.topo.get(ids[0]).unwrap();
+                let core_id = if first.topology_known { first.core_id.to_string() } else { "?".to_string() };
                 egui::Frame::group(ui.style()).stroke(Stroke::new(1.0, color.gamma_multiply(0.5))).show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
@@ -674,5 +709,452 @@ impl Gui {
             ui.add(egui::ProgressBar::new(frac).desired_width(66.0).desired_height(4.0));
             ui.label(RichText::new(freq).small().weak());
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Nothing here may reach the pkexec branch of `Gui::apply`: tests only
+    // call `apply` on a dry-run context and use `apply_direct` for real writes.
+    use super::*;
+    use crate::fake::{Fake, fake_sys};
+
+    fn cpus(s: &str) -> CpuSet {
+        CpuSet::parse_list(s).unwrap()
+    }
+
+    /// A fake machine whose topology is already cached, and a GUI over it.
+    fn setup(dry_run: bool) -> (Fake, Gui) {
+        let f = fake_sys();
+        Ctx::for_test(&f, false).discover().unwrap();
+        let g = gui(&f, dry_run);
+        (f, g)
+    }
+
+    fn gui(f: &Fake, dry_run: bool) -> Gui {
+        let ctx = Ctx::for_test(f, dry_run);
+        let (topo, globals) = ctx.discover().unwrap();
+        Gui::new(ctx, topo, globals)
+    }
+
+    fn toggle(g: &mut Gui, sel: &str) {
+        g.handle(Act::ToggleGroup(cpus(sel), sel.to_string()));
+    }
+
+    fn logged(g: &Gui, needle: &str) -> bool {
+        g.log.iter().any(|l| l.contains(needle))
+    }
+
+    /// Render one frame without a window.
+    fn draw(g: &mut Gui) {
+        let ctx = egui::Context::default();
+        // No renderer here, so the font texture update is discarded on purpose.
+        ctx.run_ui(egui::RawInput::default(), |ui| g.frame(ui)).drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn starts_clean_with_the_presets_loaded() {
+        let (_f, g) = setup(false);
+        assert!(!g.dirty() && g.log.is_empty() && g.job.is_none());
+        assert_eq!((g.selected, g.desired.clone()), (0, cpus("0-21")));
+        assert_eq!(g.presets.len(), 11);
+        assert!(g.scope == Scope::Core);
+        let (_f, dry) = setup(true);
+        assert!(logged(&dry, "DRY RUN"));
+    }
+
+    #[test]
+    fn a_broken_profiles_file_is_logged_and_builtins_remain() {
+        let f = fake_sys();
+        std::fs::write(f.dir.path().join("profiles.toml"), "[profile.x\n").unwrap();
+        let g = gui(&f, false);
+        assert_eq!(g.presets.len(), 11);
+        assert!(logged(&g, "saved profiles unavailable"));
+
+        std::fs::write(f.dir.path().join("profiles.toml"), "[profile.mine]\nonline = \"e\"\n").unwrap();
+        let g = gui(&f, false);
+        assert_eq!((g.presets.len(), g.presets[11].0.as_str()), (12, "mine"));
+        assert!(g.log.is_empty());
+    }
+
+    #[test]
+    fn toggling_stages_groups_on_and_off() {
+        let (_f, mut g) = setup(false);
+        toggle(&mut g, "13");
+        assert_eq!(g.desired, cpus("0-12,14-21"));
+        assert!(g.dirty());
+        // A group with a member off comes fully on first, then goes off.
+        toggle(&mut g, "12-15");
+        assert_eq!(g.desired, cpus("0-21"));
+        toggle(&mut g, "12-15");
+        assert_eq!(g.desired, cpus("0-11,16-21"));
+        // The fixed CPU is skipped inside a group and refused on its own.
+        toggle(&mut g, "0,5");
+        assert_eq!(g.desired, cpus("0-4,6-11,16-21"));
+        toggle(&mut g, "0");
+        assert!(g.desired.contains(0) && logged(&g, "0: cannot be taken offline"));
+        // Ids that are not CPUs are ignored.
+        toggle(&mut g, "90");
+        assert!(g.desired.iter().all(|i| i < 22));
+    }
+
+    #[test]
+    fn the_last_cpu_stays_staged_online() {
+        let (_f, mut g) = setup(false);
+        g.topo.cpus[0].hotpluggable = true;
+        toggle(&mut g, "1-21");
+        assert_eq!(g.desired, cpus("0"));
+        toggle(&mut g, "0");
+        assert_eq!(g.desired, cpus("0"));
+        assert!(logged(&g, "At least one CPU must stay online"));
+    }
+
+    #[test]
+    fn turbo_is_staged_only_when_it_differs_from_live() {
+        let (_f, mut g) = setup(false);
+        g.handle(Act::Turbo(false));
+        assert_eq!(g.turbo, Some(false));
+        assert!(g.dirty());
+        g.handle(Act::Turbo(true));
+        assert_eq!(g.turbo, None);
+        assert!(!g.dirty());
+    }
+
+    #[test]
+    fn tuning_scope_selects_cpu_core_kind_or_everything() {
+        let (_f, mut g) = setup(false);
+        g.handle(Act::Select(1));
+        assert_eq!(g.selected, 1);
+        for (scope, want) in [(Scope::Cpu, "1"), (Scope::Core, "1-2"), (Scope::Kind, "0-11"), (Scope::All, "0-21")] {
+            assert_eq!(g.scope_set(scope), cpus(want));
+        }
+        // CPUs staged offline are never tuned.
+        toggle(&mut g, "2,4-7");
+        for (scope, want) in [(Scope::Core, "1"), (Scope::Kind, "0-1,3,8-11"), (Scope::All, "0-1,3,8-21")] {
+            assert_eq!(g.scope_set(scope), cpus(want));
+        }
+        g.handle(Act::Select(2));
+        assert!(g.scope_set(Scope::Cpu).is_empty());
+        g.handle(Act::Select(99));
+        assert!(g.scope_set(Scope::All).is_empty());
+    }
+
+    #[test]
+    fn core_scope_of_an_unknown_cpu_is_that_cpu_alone() {
+        // cpu12's placeholder core_id (12) equals the real core_id of cpu3/4.
+        let f = fake_sys();
+        f.offline(12);
+        let mut g = gui(&f, false);
+        toggle(&mut g, "12");
+        g.handle(Act::Select(12));
+        assert_eq!(g.scope_set(Scope::Core), cpus("12"));
+        g.handle(Act::Select(3));
+        assert_eq!(g.scope_set(Scope::Core), cpus("3-4"));
+    }
+
+    #[test]
+    fn governor_and_epp_are_staged_for_the_scope() {
+        let (_f, mut g) = setup(false);
+        g.handle(Act::Select(13));
+        g.scope = Scope::Cpu;
+        g.handle(Act::SetGovernor("performance".into()));
+        g.scope = Scope::Kind;
+        g.handle(Act::SetEpp("power".into()));
+        assert_eq!(g.staged.keys().copied().collect::<CpuSet>(), cpus("12-19"));
+        assert_eq!(g.staged[&13].governor.as_deref(), Some("performance"));
+        assert_eq!(g.staged[&12].governor, None);
+        assert!(g.staged.values().all(|s| s.epp.as_deref() == Some("power")));
+
+        // What the panel shows: staged values over live ones.
+        let eff = g.effective(g.topo.get(13).unwrap());
+        assert_eq!((eff.governor.as_deref(), eff.epp.as_deref()), (Some("performance"), Some("power")));
+        assert_eq!((eff.min_khz, eff.max_khz), (Some(400_000), Some(3_800_000)));
+        let eff = g.effective(g.topo.get(0).unwrap());
+        assert_eq!((eff.governor.as_deref(), eff.epp.as_deref()), (Some("powersave"), Some("balance_performance")));
+    }
+
+    #[test]
+    fn frequency_limits_are_clamped_per_cpu_and_stay_ordered() {
+        let (_f, mut g) = setup(false);
+        g.scope = Scope::All;
+        g.handle(Act::SetFreq { min_khz: 3_000_000, max_khz: 4_600_000 });
+        let lim = |g: &Gui, id: usize| (g.staged[&id].min_khz.unwrap(), g.staged[&id].max_khz.unwrap());
+        assert_eq!(lim(&g, 1), (3_000_000, 4_600_000)); // 4.8 GHz core: as asked
+        assert_eq!(lim(&g, 0), (3_000_000, 4_500_000)); // capped at its 4.5 GHz
+        assert_eq!(lim(&g, 12), (3_000_000, 3_800_000));
+        assert_eq!(lim(&g, 20), (2_500_000, 2_500_000)); // both ends pulled into range
+        g.handle(Act::SetFreq { min_khz: 100, max_khz: 200 });
+        assert!(g.staged.values().all(|s| s.min_khz == Some(400_000) && s.max_khz == Some(400_000)));
+        // Inverted input cannot produce min > max.
+        g.handle(Act::SetFreq { min_khz: 3_000_000, max_khz: 1_000_000 });
+        assert!(g.staged.values().all(|s| s.min_khz <= s.max_khz));
+
+        g.handle(Act::ResetFreq);
+        assert_eq!(lim(&g, 1), (400_000, 4_800_000));
+        assert_eq!(lim(&g, 20), (400_000, 2_500_000));
+    }
+
+    #[test]
+    fn nonsense_hardware_limits_do_not_panic_the_clamp() {
+        let (_f, mut g) = setup(false);
+        g.topo.cpus[0].min_khz = Some(5_000_000); // above its own maximum
+        g.scope = Scope::Cpu;
+        g.handle(Act::SetFreq { min_khz: 1_000_000, max_khz: 2_000_000 });
+        assert!(g.staged[&0].min_khz <= g.staged[&0].max_khz);
+    }
+
+    #[test]
+    fn staging_a_preset_sets_the_target_and_clears_manual_tuning() {
+        let (_f, mut g) = setup(false);
+        g.scope = Scope::All;
+        g.handle(Act::SetGovernor("performance".into()));
+        let (name, quiet) = g.presets.iter().find(|(n, _)| n == "quiet").cloned().unwrap();
+        g.handle(Act::Preset(name, quiet.clone()));
+        assert_eq!(g.desired, cpus("0,12-21"), "cpu0 cannot go offline");
+        assert_eq!(g.turbo, Some(false));
+        assert!(g.staged.is_empty() && g.preset == Some(quiet) && g.dirty());
+        assert!(logged(&g, "Preset `quiet` staged"));
+
+        // A preset that does not fit this machine changes nothing.
+        let before = g.desired.clone();
+        g.handle(Act::Preset("bad".into(), Profile { online: Some("40-50".into()), ..Default::default() }));
+        assert_eq!(g.desired, before);
+        assert!(logged(&g, "Preset `bad`:"));
+
+        // One without an online/offline rule keeps the staged online set.
+        toggle(&mut g, "12");
+        g.handle(Act::Preset("gov".into(), Profile { governor: Some("performance".into()), ..Default::default() }));
+        assert_eq!(g.desired, cpus("0,13-21"));
+        assert_eq!(g.turbo, None);
+    }
+
+    #[test]
+    fn the_staged_profile_describes_exactly_what_is_on_screen() {
+        let (_f, mut g) = setup(false);
+        let (name, quiet) = g.presets.iter().find(|(n, _)| n == "quiet").cloned().unwrap();
+        g.handle(Act::Preset(name, quiet));
+        g.handle(Act::Turbo(true)); // live value: unstages the preset's turbo...
+        g.handle(Act::Turbo(false)); // ...and this stages it again explicitly
+        g.handle(Act::Select(12));
+        g.scope = Scope::Kind;
+        g.handle(Act::SetFreq { min_khz: 800_000, max_khz: 2_000_000 });
+        g.scope = Scope::Cpu;
+        g.handle(Act::SetGovernor("performance".into()));
+        toggle(&mut g, "19"); // tuned above, now staged offline: must be dropped
+
+        let p = g.build_profile();
+        assert_eq!(p.online.as_deref(), Some("0,12-18,20-21"));
+        assert_eq!((p.offline.clone(), p.turbo), (None, Some(false)));
+        assert_eq!((p.governor.as_deref(), p.epp.as_deref()), (Some("powersave"), Some("power")), "the preset's defaults survive");
+        assert_eq!(p.description.as_deref(), Some("Staged from GUI"));
+        let mut tune: Vec<_> = p.tune.iter().map(|t| (t.cpus.as_str(), t.governor.as_deref(), t.min_freq.as_deref(), t.max_freq.as_deref())).collect();
+        tune.sort();
+        assert_eq!(tune, [("12", Some("performance"), Some("800000khz"), Some("2000000khz")), ("13-18", None, Some("800000khz"), Some("2000000khz"))]);
+
+        // And it resolves to a request the planner accepts.
+        let req = profile::to_request(&g.topo, &p).unwrap();
+        assert_eq!((req.online.clone(), req.offline.clone()), (cpus("0,12-18,20-21"), cpus("1-11,19")));
+        assert!(g.ctx.plan(&g.topo, &req).is_ok());
+    }
+
+    #[test]
+    fn apply_with_nothing_staged_only_logs() {
+        let (f, mut g) = setup(true);
+        g.handle(Act::Apply);
+        assert!(logged(&g, "Nothing staged") && g.job.is_none());
+        assert_eq!(f.read("cpu13/online"), "1");
+    }
+
+    #[test]
+    fn a_dry_run_apply_logs_the_plan_and_keeps_the_staging() {
+        let (f, mut g) = setup(true);
+        toggle(&mut g, "13");
+        g.handle(Act::Turbo(false));
+        g.handle(Act::Apply);
+        assert!(logged(&g, "would: take cpu13 offline") && logged(&g, "would: turbo boost disabled"));
+        assert!(logged(&g, "warning: online CPUs will be non-contiguous"));
+        assert!(g.dirty() && g.job.is_none());
+        assert_eq!((f.read("cpu13/online"), f.read("intel_pstate/no_turbo")), ("1".to_string(), "0".to_string()));
+    }
+
+    #[test]
+    fn a_direct_apply_writes_refreshes_and_clears_the_staging() {
+        let (f, mut g) = setup(false);
+        toggle(&mut g, "20-21");
+        g.handle(Act::Select(12));
+        g.scope = Scope::Kind;
+        g.handle(Act::SetGovernor("performance".into()));
+        g.handle(Act::Turbo(false));
+        let p = g.build_profile();
+        g.apply_direct(&p);
+        assert!(logged(&g, "did: take cpu20 offline") && logged(&g, "11 applied, 0 failed"), "{:?}", g.log);
+        assert_eq!((f.read("cpu20/online"), f.read("cpu21/online")), ("0".to_string(), "0".to_string()));
+        assert_eq!(f.read("cpu19/cpufreq/scaling_governor"), "performance");
+        assert_eq!(f.read("intel_pstate/no_turbo"), "1");
+        assert!(!g.dirty());
+        assert_eq!(g.desired, cpus("0-19"));
+        assert_eq!(g.globals.no_turbo, Some(true));
+    }
+
+    #[test]
+    fn a_direct_apply_that_fails_keeps_the_staging() {
+        let (f, mut g) = setup(false);
+        toggle(&mut g, "13-14");
+        std::fs::remove_file(f.root().join("cpu13/online")).unwrap();
+        let p = g.build_profile();
+        g.apply_direct(&p);
+        assert!(logged(&g, "FAILED: take cpu13 offline") && logged(&g, "1 applied, 1 failed"), "{:?}", g.log);
+        assert!(g.dirty() && !g.desired.contains(13));
+
+        // An invalid staged profile is an error line, not a panic.
+        g.apply_direct(&Profile { online: Some("none".into()), ..Default::default() });
+        assert!(logged(&g, "error: "));
+    }
+
+    #[test]
+    fn the_staged_profile_file_is_private_fresh_and_parseable() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Profile { online: Some("0-3".into()), governor: Some("powersave".into()), ..Default::default() };
+        let a = write_staged(p.clone()).unwrap();
+        let b = write_staged(p.clone()).unwrap();
+        assert_ne!(a, b, "every apply gets its own file");
+        assert!(a.starts_with(std::env::temp_dir()));
+        assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        // The privileged side loads it like any profiles file.
+        let file = ProfileFile::load(&a).unwrap();
+        assert_eq!(profile::lookup(&file, STAGED_NAME), Some(p));
+        for f in [a, b] {
+            std::fs::remove_file(f).unwrap();
+        }
+    }
+
+    /// A GUI with a finished helper job reporting `result`.
+    fn finished(result: Result<(i32, String), String>) -> (Fake, Gui, PathBuf) {
+        let (f, mut g) = setup(false);
+        toggle(&mut g, "13");
+        let tmp = f.dir.path().join("staged.toml");
+        std::fs::write(&tmp, "").unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        g.job = Some(Job { rx, tmp: tmp.clone() });
+        (f, g, tmp)
+    }
+
+    #[test]
+    fn a_pending_helper_job_blocks_a_second_apply() {
+        let (f, mut g) = setup(false);
+        toggle(&mut g, "13");
+        let (_tx, rx) = mpsc::channel();
+        g.job = Some(Job { rx, tmp: f.dir.path().join("staged.toml") });
+        let lines = g.log.len();
+        g.handle(Act::Apply); // must return before doing anything
+        assert_eq!(g.log.len(), lines);
+        // Still running: polling leaves it in place.
+        g.poll_job(&egui::Context::default());
+        assert!(g.job.is_some() && g.dirty());
+    }
+
+    #[test]
+    fn helper_success_refreshes_and_clears_the_staging() {
+        let (f, mut g, tmp) = finished(Ok((0, "  did: take cpu13 offline\n\n1 change(s) applied, 0 failed\n".into())));
+        f.offline(13); // what the privileged helper did
+        g.poll_job(&egui::Context::default());
+        assert!(g.job.is_none() && !tmp.exists(), "the staged file is removed");
+        assert!(logged(&g, "did: take cpu13 offline") && logged(&g, "Applied"));
+        assert!(!g.log.iter().any(|l| l.trim().is_empty()));
+        assert!(!g.dirty() && !g.topo.get(13).unwrap().online);
+    }
+
+    #[test]
+    fn helper_failures_keep_the_staging_and_explain() {
+        for (result, needle) in [
+            (Ok((126, String::new())), "Authentication dismissed"),
+            (Ok((127, String::new())), "not authorized"),
+            (Ok((1, "failed: take cpu13 offline: boom\n".to_string())), "Finished with errors (exit 1)"),
+            (Ok((-1, String::new())), "Finished with errors (exit -1)"),
+            (Err("could not run pkexec: No such file or directory".to_string()), "could not run pkexec"),
+        ] {
+            let (_f, mut g, tmp) = finished(result);
+            g.poll_job(&egui::Context::default());
+            assert!(logged(&g, needle), "{needle}: {:?}", g.log);
+            assert!(g.job.is_none() && !tmp.exists());
+            assert!(g.dirty() && !g.desired.contains(13), "{needle}: staging must survive");
+        }
+    }
+
+    #[test]
+    fn discard_and_refresh() {
+        let (f, mut g) = setup(false);
+        toggle(&mut g, "13");
+        g.handle(Act::Turbo(false));
+        g.handle(Act::SetGovernor("performance".into()));
+        g.handle(Act::Discard);
+        assert!(!g.dirty() && g.staged.is_empty() && g.preset.is_none());
+
+        f.offline(5);
+        g.handle(Act::Refresh);
+        assert!(!g.topo.get(5).unwrap().online);
+        // The change came from outside, so it shows as a pending difference.
+        assert!(g.dirty() && g.desired.contains(5));
+
+        std::fs::remove_file(f.root().join("present")).unwrap();
+        g.handle(Act::Refresh);
+        assert!(logged(&g, "refresh failed") && g.topo.cpus.len() == 22);
+    }
+
+    #[test]
+    fn the_log_is_bounded() {
+        let (_f, mut g) = setup(false);
+        for i in 0..500 {
+            g.say(format!("line {i}"));
+        }
+        assert_eq!(g.log.len(), 200);
+        assert_eq!((g.log[0].as_str(), g.log[199].as_str()), ("line 300", "line 499"));
+    }
+
+    #[test]
+    fn every_panel_renders_headless_in_every_state() {
+        let (f, mut g) = setup(true);
+        draw(&mut g);
+
+        // Staged hotplug, tuning and a preset; an offline CPU selected.
+        toggle(&mut g, "13");
+        g.handle(Act::Select(13));
+        g.handle(Act::Turbo(false));
+        draw(&mut g);
+        g.handle(Act::Select(1));
+        g.scope = Scope::Kind;
+        g.handle(Act::SetGovernor("performance".into()));
+        g.handle(Act::SetFreq { min_khz: 800_000, max_khz: 2_000_000 });
+        let (name, p) = g.presets[9].clone();
+        g.handle(Act::Preset(name, p));
+        g.handle(Act::Apply); // dry run: fills the log
+        draw(&mut g);
+
+        // A helper job in flight (spinner, Apply disabled).
+        let (_tx, rx) = mpsc::channel();
+        g.job = Some(Job { rx, tmp: f.dir.path().join("none.toml") });
+        draw(&mut g);
+        g.job = None;
+
+        // A selection that no longer exists, and missing global knobs.
+        g.handle(Act::Select(99));
+        g.globals = Globals::default();
+        draw(&mut g);
+
+        // CPUs really offline, one of them with unknown topology.
+        let f = fake_sys();
+        f.offline(12);
+        f.offline(2);
+        let mut g = gui(&f, true);
+        for id in [12, 2, 0, 21] {
+            g.handle(Act::Select(id));
+            draw(&mut g);
+        }
+        // CPUs without cpufreq at all (no sliders, no bars).
+        for c in &mut g.topo.cpus {
+            (c.min_khz, c.max_khz, c.cur_khz, c.governor, c.epp) = (None, None, None, None, None);
+        }
+        draw(&mut g);
     }
 }

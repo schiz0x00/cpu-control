@@ -22,7 +22,7 @@
 
 use crate::cpuset::CpuSet;
 use crate::topology::{CoreKind, Topology};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 pub fn eval(topo: &Topology, expr: &str) -> Result<CpuSet> {
     let all = topo.all();
@@ -55,11 +55,13 @@ fn eval_term(topo: &Topology, term: &str) -> Result<CpuSet> {
         "offline" => topo.all().difference(&topo.online()),
         _ => {
             if let Some(n) = lower.strip_prefix("core:") {
-                let id: usize = n.trim().parse()?;
+                let id: usize = n.trim().parse().with_context(|| format!("invalid core id in `{term}`"))?;
+                // The core_id of an offline CPU with no cached topology is a
+                // placeholder and must not be mistaken for a real core.
                 let cores: CpuSet = topo
                     .cpus
                     .iter()
-                    .filter(|c| c.core_id == id)
+                    .filter(|c| c.topology_known && c.core_id == id)
                     .map(|c| c.id)
                     .collect();
                 if cores.is_empty() {
@@ -67,7 +69,7 @@ fn eval_term(topo: &Topology, term: &str) -> Result<CpuSet> {
                 }
                 cores
             } else if let Some(n) = lower.strip_prefix("l2:") {
-                let id: usize = n.trim().parse()?;
+                let id: usize = n.trim().parse().with_context(|| format!("invalid CPU id in `{term}`"))?;
                 match topo.get(id) {
                     Some(c) => c.l2_group.clone(),
                     None => bail!("cpu{id} does not exist"),
@@ -109,5 +111,123 @@ pub mod tests {
         assert!(eval(&topo, "99").is_err());
         assert!(eval(&topo, "bogus").is_err());
         assert!(eval(&topo, "core:9999").is_err());
+    }
+
+    fn sel(topo: &Topology, expr: &str) -> String {
+        eval(topo, expr).unwrap_or_else(|e| panic!("`{expr}`: {e:#}")).to_string()
+    }
+
+    #[test]
+    fn every_documented_term() {
+        let (_f, topo) = fake_meteor_lake();
+        for (expr, want) in [
+            ("7", "7"),
+            ("3-6", "3-6"),
+            ("all", "0-21"),
+            ("none", "-"),
+            ("p", "0-11"),
+            ("e", "12-19"),
+            ("lpe", "20-21"),
+            ("smt", "2,4-5,7,9,11"),
+            ("primary", "0-1,3,6,8,10,12-21"),
+            ("core:16", "0,5"),
+            ("core:0", "12"),
+            ("l2:0", "0,5"),
+            ("l2:18", "16-19"),
+            ("l2:21", "20-21"),
+            ("online", "0-21"),
+            ("offline", "-"),
+        ] {
+            assert_eq!(sel(&topo, expr), want, "`{expr}`");
+        }
+    }
+
+    #[test]
+    fn aliases_case_and_spacing() {
+        let (_f, topo) = fake_meteor_lake();
+        for (alias, canonical) in [
+            ("pcore", "p"),
+            ("pcores", "p"),
+            ("performance", "p"),
+            ("ecore", "e"),
+            ("ecores", "e"),
+            ("efficiency", "e"),
+            ("lp-e", "lpe"),
+            ("lpecore", "lpe"),
+            ("lpecores", "lpe"),
+            ("ht", "smt"),
+            ("secondary", "smt"),
+            ("P", "p"),
+            ("LPE", "lpe"),
+            ("All", "all"),
+            ("CORE:8", "core:8"),
+            ("L2:13", "l2:13"),
+            (" p , ^ smt ", "p,^smt"),
+            ("p,,", "p"),
+            ("all,!p", "all,^p"),
+        ] {
+            assert_eq!(sel(&topo, alias), sel(&topo, canonical), "`{alias}`");
+        }
+    }
+
+    #[test]
+    fn terms_apply_left_to_right() {
+        let (_f, topo) = fake_meteor_lake();
+        assert_eq!(sel(&topo, ""), "-");
+        assert_eq!(sel(&topo, "^p"), "-"); // nothing to subtract from yet
+        assert_eq!(sel(&topo, "^p,e"), "12-19");
+        assert_eq!(sel(&topo, "e,^e"), "-");
+        assert_eq!(sel(&topo, "e,^e,e"), "12-19");
+        assert_eq!(sel(&topo, "all,^p,^lpe"), "12-19");
+        assert_eq!(sel(&topo, "all,^3-20"), "0-2,21");
+        assert_eq!(sel(&topo, "p,^smt,e"), "0-1,3,6,8,10,12-19");
+        assert_eq!(sel(&topo, "all,^none"), "0-21");
+        assert_eq!(sel(&topo, "1,1,1"), "1");
+    }
+
+    #[test]
+    fn online_and_offline_follow_live_state() {
+        let (f, _) = fake_meteor_lake();
+        f.offline(3);
+        f.offline(20);
+        let topo = f.discover();
+        assert_eq!(sel(&topo, "offline"), "3,20");
+        assert_eq!(sel(&topo, "online"), "0-2,4-19,21");
+        assert_eq!(sel(&topo, "all,^online"), "3,20");
+    }
+
+    #[test]
+    fn error_messages_say_what_is_wrong() {
+        let (_f, topo) = fake_meteor_lake();
+        for (expr, needle) in [
+            ("22", "cpu22 does not exist"),
+            ("20-25", "does not exist"),
+            ("^99", "cpu99 does not exist"), // a typo is an error even when subtracting
+            ("bogus", "unknown selector `bogus`"),
+            ("p,e,x", "unknown selector `x`"),
+            ("3-1", "unknown selector `3-1`"),
+            ("core:", "invalid core id"),
+            ("core:x", "invalid core id"),
+            ("core:-1", "invalid core id"),
+            ("core:9999", "no physical core with core_id 9999"),
+            ("l2:x", "invalid CPU id"),
+            ("l2:40", "cpu40 does not exist"),
+            ("0-99999999999", "unknown selector"),
+        ] {
+            let err = format!("{:#}", eval(&topo, expr).unwrap_err());
+            assert!(err.contains(needle), "`{expr}` gave `{err}`, wanted `{needle}`");
+        }
+    }
+
+    #[test]
+    fn core_selector_ignores_placeholder_core_ids() {
+        // Offline with no cache, cpu12 reports core_id 12 as a placeholder,
+        // which is also the real core_id of the P-core holding cpu3 and cpu4.
+        let (f, _) = fake_meteor_lake();
+        f.offline(12);
+        let topo = f.discover();
+        assert_eq!(sel(&topo, "core:12"), "3-4");
+        // Its real core (core_id 0) is unknown for now.
+        assert!(eval(&topo, "core:0").is_err());
     }
 }

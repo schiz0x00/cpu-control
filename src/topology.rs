@@ -4,7 +4,8 @@
 //! be tested against a fake tree.
 
 use crate::cpuset::CpuSet;
-use anyhow::{Context, Result};
+use crate::fsutil::write_atomic;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -47,7 +48,7 @@ pub struct Cpu {
     pub hotpluggable: bool,
     pub online: bool,
     /// `false` when this CPU is offline and no cached topology was available,
-    /// so `siblings`/`l2_group`/`core_id` are guesses.
+    /// so `kind`/`siblings`/`l2_group`/`core_id` are guesses.
     pub topology_known: bool,
     pub min_khz: Option<u64>,
     pub max_khz: Option<u64>,
@@ -74,6 +75,7 @@ pub struct Topology {
 #[derive(Clone, Debug, Default)]
 pub struct Globals {
     pub smt_control: Option<String>,
+    /// `Some(true)` when turbo/boost is switched off; `None` without a control.
     pub no_turbo: Option<bool>,
     pub pstate_status: Option<String>,
     pub available_governors: Vec<String>,
@@ -125,7 +127,9 @@ impl Topology {
             let has_l3 = find_cache_group(&dir, 3).is_some();
 
             // Offline CPUs hide their topology/cache entries; `apply_cache`
-            // repairs those from the persisted cache afterwards.
+            // repairs those from the persisted cache afterwards. They also
+            // vanish from the hybrid PMU lists, so without a cache an offline
+            // CPU falls through to `P` here: a guess (`topology_known` is false).
             let kind = if lp_set.contains(id) {
                 CoreKind::LpE
             } else if e_set.contains(id) {
@@ -155,8 +159,12 @@ impl Topology {
                 epp: read_trim(cf.join("energy_performance_preference")),
             });
         }
+        if cpus.is_empty() {
+            bail!("no CPUs found under {}", root.display());
+        }
         let mut topo = Topology { cpus };
         topo.apply_cache(cache);
+        topo.merge_groups();
         Ok(topo)
     }
 
@@ -183,17 +191,26 @@ impl Topology {
 }
 
 impl Globals {
-    pub fn read(root: &Path) -> Globals {
-        let cpu0 = cpu_dir(root, 0).join("cpufreq");
-        let words = |p: PathBuf| -> Vec<String> {
-            read_trim(p).map(|s| s.split_whitespace().map(String::from).collect()).unwrap_or_default()
+    pub fn read(root: &Path, topo: &Topology) -> Globals {
+        // Any online CPU can answer; cpu0 is not guaranteed to be one everywhere.
+        let words = |name: &str| -> Vec<String> {
+            topo.cpus
+                .iter()
+                .filter(|c| c.online)
+                .find_map(|c| read_trim(cpu_dir(root, c.id).join("cpufreq").join(name)))
+                .map(|s| s.split_whitespace().map(String::from).collect())
+                .unwrap_or_default()
         };
         Globals {
             smt_control: read_trim(root.join("smt/control")),
-            no_turbo: read_trim(root.join("intel_pstate/no_turbo")).map(|s| s == "1"),
+            // Same precedence as the plan: intel_pstate's switch, else the
+            // generic cpufreq boost flag (which has the opposite polarity).
+            no_turbo: read_trim(root.join("intel_pstate/no_turbo"))
+                .map(|s| s == "1")
+                .or_else(|| read_trim(root.join("cpufreq/boost")).map(|s| s == "0")),
             pstate_status: read_trim(root.join("intel_pstate/status")),
-            available_governors: words(cpu0.join("scaling_available_governors")),
-            available_epp: words(cpu0.join("energy_performance_available_preferences")),
+            available_governors: words("scaling_available_governors"),
+            available_epp: words("energy_performance_available_preferences"),
         }
     }
 }
@@ -260,10 +277,12 @@ impl TopologyCache {
                 },
             );
         }
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+        let text = toml::to_string_pretty(&cache)?;
+        // The UIs re-discover every second: leave an up-to-date file alone.
+        if fs::read_to_string(path).is_ok_and(|old| old == text) {
+            return Ok(());
         }
-        fs::write(path, toml::to_string_pretty(&cache)?)?;
+        write_atomic(path, &text)?;
         Ok(())
     }
 }
@@ -287,21 +306,49 @@ impl Topology {
             }
         }
     }
+
+    /// The kernel drops an offline CPU from its relatives' `thread_siblings_list`
+    /// and cache `shared_cpu_list`, so the live lists shrink as CPUs go down
+    /// while the cached list of the offline CPU still names everyone. Merge all
+    /// overlapping lists so every group is whole and symmetric whatever happens
+    /// to be online (and so the shrunken lists never reach the cache).
+    fn merge_groups(&mut self) {
+        fn find(leader: &BTreeMap<usize, usize>, mut id: usize) -> usize {
+            while leader[&id] != id {
+                id = leader[&id];
+            }
+            id
+        }
+        let fields: [fn(&mut Cpu) -> &mut CpuSet; 2] = [|c| &mut c.siblings, |c| &mut c.l2_group];
+        let all = self.all();
+        for field in fields {
+            // Union-find: each id chains to the lowest id of its group.
+            let mut leader: BTreeMap<usize, usize> = all.iter().map(|id| (id, id)).collect();
+            for cpu in self.cpus.iter_mut() {
+                let id = cpu.id;
+                // A stale cache may name CPUs that no longer exist: ignore those.
+                for member in field(cpu).intersection(&all).iter() {
+                    let (a, b) = (find(&leader, id), find(&leader, member));
+                    if a != b {
+                        leader.insert(a.max(b), a.min(b));
+                    }
+                }
+            }
+            let mut groups: BTreeMap<usize, CpuSet> = BTreeMap::new();
+            for id in all.iter() {
+                groups.entry(find(&leader, id)).or_default().insert(id);
+            }
+            for cpu in self.cpus.iter_mut() {
+                *field(cpu) = groups[&find(&leader, cpu.id)].clone();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fake::fake_sys;
-
-    /// Mimic the kernel: an offlined CPU loses its topology/ and cache/ dirs.
-    fn offline_like_kernel(f: &crate::fake::Fake, id: usize) {
-        let d = f.root().join(format!("cpu{id}"));
-        fs::write(d.join("online"), "0\n").unwrap();
-        fs::remove_dir_all(d.join("topology")).unwrap();
-        fs::remove_dir_all(d.join("cache")).unwrap();
-        fs::remove_dir_all(d.join("cpufreq")).unwrap();
-    }
 
     #[test]
     fn cache_preserves_topology_of_offline_cpus() {
@@ -311,13 +358,15 @@ mod tests {
         TopologyCache::save(&cache_path, &before).unwrap();
 
         // Offline an SMT sibling (cpu2) and an LP-E core (cpu20).
-        offline_like_kernel(&f, 2);
-        offline_like_kernel(&f, 20);
+        f.offline(2);
+        f.offline(20);
 
-        // Without the cache the facts are lost...
+        // Without the cache the facts are lost (the kernel even drops an
+        // offline CPU from the hybrid PMU lists, so its type is a guess)...
         let blind = Topology::discover(&f.root(), &f.devices(), None).unwrap();
         assert!(!blind.get(2).unwrap().topology_known);
-        assert_eq!(blind.get(20).unwrap().kind, CoreKind::E);
+        assert!(!blind.get(20).unwrap().topology_known);
+        assert_eq!(blind.get(20).unwrap().kind, CoreKind::P);
 
         // ...with it, they are recovered.
         let cache = TopologyCache::load(&cache_path).unwrap();
@@ -334,7 +383,7 @@ mod tests {
         let f = fake_sys();
         let path = f.dir.path().join("topology.toml");
         TopologyCache::save(&path, &f.discover()).unwrap();
-        offline_like_kernel(&f, 2);
+        f.offline(2);
         let cache = TopologyCache::load(&path).unwrap();
         let topo = Topology::discover(&f.root(), &f.devices(), Some(&cache)).unwrap();
         // Re-saving while cpu2 is offline must not clobber its cached entry.
@@ -350,8 +399,293 @@ mod tests {
         TopologyCache::save(&path, &f.discover()).unwrap();
         let mut cache = TopologyCache::load(&path).unwrap();
         cache.present = "0-7".into();
-        offline_like_kernel(&f, 2);
+        f.offline(2);
         let topo = Topology::discover(&f.root(), &f.devices(), Some(&cache)).unwrap();
         assert!(!topo.get(2).unwrap().topology_known);
+    }
+
+    /// What `Ctx::discover` does on every run: load the cache, look, save.
+    fn run_once(f: &crate::fake::Fake, cache_path: &Path) -> Topology {
+        let cache = TopologyCache::load(cache_path);
+        let topo = Topology::discover(&f.root(), &f.devices(), cache.as_ref()).unwrap();
+        TopologyCache::save(cache_path, &topo).unwrap();
+        topo
+    }
+
+    fn set(s: &str) -> CpuSet {
+        CpuSet::parse_list(s).unwrap()
+    }
+
+    #[test]
+    fn discovers_the_whole_hybrid_layout() {
+        let f = fake_sys();
+        let t = f.discover();
+        assert_eq!(t.cpus.len(), 22);
+        assert_eq!(t.all(), set("0-21"));
+        assert_eq!(t.online(), set("0-21"));
+        assert_eq!(t.of_kind(CoreKind::P), set("0-11"));
+        assert_eq!(t.of_kind(CoreKind::E), set("12-19"));
+        // In cpu_atom's list but without an L3: the low-power cores.
+        assert_eq!(t.of_kind(CoreKind::LpE), set("20-21"));
+        assert!(t.cpus.iter().all(|c| c.topology_known && c.online && c.package == 0));
+        assert!(t.cpus.windows(2).all(|w| w[0].id < w[1].id));
+
+        let c0 = t.get(0).unwrap();
+        assert!(!c0.hotpluggable, "cpu0 has no online file");
+        assert_eq!((c0.core_id, &c0.siblings, &c0.l2_group), (16, &set("0,5"), &set("0,5")));
+        assert!(t.cpus.iter().skip(1).all(|c| c.hotpluggable));
+
+        let c13 = t.get(13).unwrap();
+        assert_eq!((c13.core_id, &c13.siblings, &c13.l2_group), (1, &set("13"), &set("12-15")));
+        assert_eq!((c13.min_khz, c13.max_khz, c13.cur_khz), (Some(400_000), Some(3_800_000), Some(1_200_000)));
+        assert_eq!((c13.scaling_min_khz, c13.scaling_max_khz), (Some(400_000), Some(3_800_000)));
+        assert_eq!((c13.governor.as_deref(), c13.epp.as_deref()), (Some("powersave"), Some("balance_performance")));
+        assert_eq!(t.get(1).unwrap().max_khz, Some(4_800_000));
+        assert_eq!(t.get(21).unwrap().l2_group, set("20-21"));
+        assert!(t.get(22).is_none());
+    }
+
+    #[test]
+    fn smt_threads_are_every_thread_but_the_first_of_each_core() {
+        let t = fake_sys().discover();
+        assert_eq!(t.smt_secondaries(), set("2,4-5,7,9,11"));
+        assert!(!t.get(0).unwrap().is_secondary_thread());
+        assert!(t.get(5).unwrap().is_secondary_thread()); // cpu0's sibling
+        assert!(!t.get(12).unwrap().is_secondary_thread()); // E-cores have one thread
+    }
+
+    #[test]
+    fn a_cpu_without_hybrid_pmus_is_all_p_cores() {
+        let f = fake_sys();
+        fs::remove_dir_all(f.devices().join("cpu_core")).unwrap();
+        fs::remove_dir_all(f.devices().join("cpu_atom")).unwrap();
+        let t = f.discover();
+        assert_eq!(t.of_kind(CoreKind::P), t.all());
+    }
+
+    #[test]
+    fn the_low_power_pmu_wins_over_the_l3_heuristic() {
+        let f = fake_sys();
+        fs::create_dir_all(f.devices().join("cpu_lowpower")).unwrap();
+        fs::write(f.devices().join("cpu_lowpower/cpus"), "19\n").unwrap();
+        let t = f.discover();
+        assert_eq!(t.get(19).unwrap().kind, CoreKind::LpE); // has an L3, listed explicitly
+        assert_eq!(t.of_kind(CoreKind::LpE), set("19-21"));
+    }
+
+    #[test]
+    fn atom_cores_without_l3_are_plain_e_cores_when_there_are_no_p_cores() {
+        let f = fake_sys();
+        fs::remove_dir_all(f.devices().join("cpu_core")).unwrap();
+        let t = f.discover();
+        assert_eq!(t.get(20).unwrap().kind, CoreKind::E);
+        assert!(t.of_kind(CoreKind::LpE).is_empty());
+    }
+
+    #[test]
+    fn cpu_list_comes_from_present_then_possible() {
+        let f = fake_sys();
+        fs::rename(f.root().join("present"), f.root().join("possible")).unwrap();
+        assert_eq!(f.discover().cpus.len(), 22);
+
+        fs::remove_file(f.root().join("possible")).unwrap();
+        let err = Topology::discover(&f.root(), &f.devices(), None).unwrap_err();
+        assert!(err.to_string().contains(&f.root().display().to_string()), "{err}");
+
+        f.write("present", "0-zz");
+        assert!(Topology::discover(&f.root(), &f.devices(), None).is_err());
+    }
+
+    #[test]
+    fn listed_cpus_without_a_directory_are_skipped() {
+        let f = fake_sys();
+        f.write("present", "0-31"); // sockets for CPUs that are not there
+        assert_eq!(f.discover().all(), set("0-21"));
+    }
+
+    #[test]
+    fn a_tree_without_any_cpu_is_an_error_not_an_empty_topology() {
+        // An empty topology would make every UI index out of bounds.
+        let f = fake_sys();
+        f.write("present", "");
+        let err = Topology::discover(&f.root(), &f.devices(), None).unwrap_err();
+        assert!(err.to_string().contains("no CPUs found"), "{err}");
+        f.write("present", "40-41");
+        assert!(Topology::discover(&f.root(), &f.devices(), None).is_err());
+    }
+
+    #[test]
+    fn an_offline_cpu_without_cache_is_marked_as_guesswork() {
+        let f = fake_sys();
+        f.offline(12);
+        let t = f.discover();
+        let c = t.get(12).unwrap();
+        assert!(!c.online && c.hotpluggable && !c.topology_known);
+        // Placeholders: its own id as core, alone in every group.
+        assert_eq!((c.core_id, &c.siblings, &c.l2_group), (12, &set("12"), &set("12")));
+        assert_eq!((c.max_khz, c.scaling_max_khz, c.cur_khz, c.governor.clone()), (None, None, None, None));
+        assert_eq!(t.online(), set("0-11,13-21"));
+    }
+
+    #[test]
+    fn groups_stay_whole_when_the_kernel_shrinks_the_live_lists() {
+        let f = fake_sys();
+        let cache = f.dir.path().join("topology.toml");
+        run_once(&f, &cache);
+
+        // Offline the *first* thread of core 8: the kernel now reports cpu2
+        // as the only thread of its core, and cpu13 drops out of the L2 lists.
+        f.offline(1);
+        f.offline(13);
+        assert_eq!(f.read("cpu2/topology/thread_siblings_list"), "2");
+        assert_eq!(f.read("cpu12/cache/index2/shared_cpu_list"), "12,14-15");
+
+        let t = run_once(&f, &cache);
+        assert_eq!(t.get(2).unwrap().siblings, set("1-2"));
+        assert_eq!(t.get(1).unwrap().siblings, set("1-2"));
+        assert!(t.get(2).unwrap().is_secondary_thread(), "cpu2 must not turn into a primary thread");
+        assert_eq!(t.smt_secondaries(), set("2,4-5,7,9,11"));
+        for id in 12..16 {
+            assert_eq!(t.get(id).unwrap().l2_group, set("12-15"), "cpu{id}");
+        }
+    }
+
+    #[test]
+    fn the_cache_survives_any_order_of_offlining_and_onlining() {
+        let f = fake_sys();
+        let cache = f.dir.path().join("topology.toml");
+        run_once(&f, &cache);
+        // Each run saves what it saw; shrunken live lists must never be what
+        // ends up remembered for a CPU.
+        f.offline(2);
+        run_once(&f, &cache);
+        f.online(2);
+        f.offline(1);
+        run_once(&f, &cache);
+        f.offline(2);
+        let t = run_once(&f, &cache);
+        for id in [1, 2] {
+            let c = t.get(id).unwrap();
+            assert!(!c.online && c.topology_known);
+            assert_eq!((c.core_id, &c.siblings, c.kind), (8, &set("1-2"), CoreKind::P), "cpu{id}");
+        }
+        assert_eq!(t.smt_secondaries(), set("2,4-5,7,9,11"));
+        // And once everything is back the cache matches a fresh look.
+        f.online(1);
+        f.online(2);
+        let t = run_once(&f, &cache);
+        assert!(t.cpus.iter().all(|c| c.online && c.topology_known));
+        assert_eq!(t.get(1).unwrap().siblings, set("1-2"));
+    }
+
+    #[test]
+    fn cached_limits_fill_in_for_offline_cpus() {
+        let f = fake_sys();
+        let cache = f.dir.path().join("topology.toml");
+        run_once(&f, &cache);
+        f.offline(20);
+        let c = run_once(&f, &cache).get(20).cloned().unwrap();
+        assert_eq!((c.kind, c.min_khz, c.max_khz), (CoreKind::LpE, Some(400_000), Some(2_500_000)));
+        assert_eq!((c.scaling_max_khz, c.governor), (None, None)); // live values stay unknown
+    }
+
+    #[test]
+    fn cache_entries_naming_cpus_that_do_not_exist_are_ignored() {
+        let f = fake_sys();
+        let path = f.dir.path().join("topology.toml");
+        TopologyCache::save(&path, &f.discover()).unwrap();
+        let mut cache = TopologyCache::load(&path).unwrap();
+        cache.cpu.get_mut("2").unwrap().siblings.push(99);
+        cache.cpu.get_mut("2").unwrap().l2_group.push(99);
+        f.offline(2);
+        let t = Topology::discover(&f.root(), &f.devices(), Some(&cache)).unwrap();
+        assert_eq!(t.get(2).unwrap().siblings, set("1-2"));
+        assert_eq!(t.get(2).unwrap().l2_group, set("1-2"));
+    }
+
+    #[test]
+    fn an_unchanged_cache_file_is_left_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let f = fake_sys();
+        let path = f.dir.path().join("state/topology.toml");
+        let topo = f.discover();
+        TopologyCache::save(&path, &topo).unwrap();
+        let first = fs::metadata(&path).unwrap().ino();
+        // The UIs call this every second: no new file may appear each time.
+        TopologyCache::save(&path, &topo).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), first);
+        // A real change is written (as a fresh file renamed into place).
+        let mut changed = topo.clone();
+        changed.cpus[3].core_id = 99;
+        TopologyCache::save(&path, &changed).unwrap();
+        assert_eq!(TopologyCache::load(&path).unwrap().cpu["3"].core_id, 99);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_cache_loads_as_none() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(TopologyCache::load(&d.path().join("nope.toml")).is_none());
+        let bad = d.path().join("bad.toml");
+        fs::write(&bad, "present = \"0-3\"\n[cpu.0\nkind = ").unwrap();
+        assert!(TopologyCache::load(&bad).is_none());
+        // ...and saving over a corrupt file replaces it with a good one.
+        let f = fake_sys();
+        TopologyCache::save(&bad, &f.discover()).unwrap();
+        assert_eq!(TopologyCache::load(&bad).unwrap().cpu.len(), 22);
+    }
+
+    #[test]
+    fn globals_read_the_intel_pstate_knobs() {
+        let f = fake_sys();
+        let t = f.discover();
+        let g = Globals::read(&f.root(), &t);
+        assert_eq!(g.smt_control.as_deref(), Some("on"));
+        assert_eq!(g.no_turbo, Some(false));
+        assert_eq!(g.pstate_status.as_deref(), Some("active"));
+        assert_eq!(g.available_governors, ["performance", "powersave"]);
+        assert_eq!(g.available_epp, ["default", "performance", "balance_performance", "balance_power", "power"]);
+        f.write("intel_pstate/no_turbo", "1");
+        assert_eq!(Globals::read(&f.root(), &t).no_turbo, Some(true));
+    }
+
+    #[test]
+    fn globals_fall_back_to_the_generic_boost_flag() {
+        let f = fake_sys();
+        let t = f.discover();
+        fs::remove_dir_all(f.root().join("intel_pstate")).unwrap();
+        fs::remove_dir_all(f.root().join("smt")).unwrap();
+        let g = Globals::read(&f.root(), &t);
+        assert_eq!((g.no_turbo, g.smt_control, g.pstate_status), (None, None, None));
+        // `boost` is "1 = on", the opposite of `no_turbo`.
+        f.write("cpufreq/boost", "1");
+        assert_eq!(Globals::read(&f.root(), &t).no_turbo, Some(false));
+        f.write("cpufreq/boost", "0");
+        assert_eq!(Globals::read(&f.root(), &t).no_turbo, Some(true));
+    }
+
+    #[test]
+    fn globals_take_governor_lists_from_any_online_cpu() {
+        let f = fake_sys();
+        fs::remove_dir_all(f.root().join("cpu0/cpufreq")).unwrap();
+        let t = f.discover();
+        assert_eq!(Globals::read(&f.root(), &t).available_governors, ["performance", "powersave"]);
+        for c in &t.cpus {
+            let _ = fs::remove_dir_all(f.root().join(format!("cpu{}/cpufreq", c.id)));
+        }
+        let g = Globals::read(&f.root(), &t);
+        assert!(g.available_governors.is_empty() && g.available_epp.is_empty());
+    }
+
+    #[test]
+    fn small_helpers() {
+        assert_eq!([CoreKind::P, CoreKind::E, CoreKind::LpE].map(|k| k.to_string()), ["P", "E", "LP-E"]);
+        assert_eq!(cpu_dir(Path::new("/sys/x"), 7), Path::new("/sys/x/cpu7"));
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("v"), "  42 \n").unwrap();
+        assert_eq!(read_trim(d.path().join("v")).as_deref(), Some("42"));
+        assert_eq!(read_u64(d.path().join("v")), Some(42));
+        assert_eq!(read_trim(d.path().join("missing")), None);
+        fs::write(d.path().join("v"), "-1\n").unwrap();
+        assert_eq!(read_u64(d.path().join("v")), None);
     }
 }

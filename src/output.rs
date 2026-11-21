@@ -18,12 +18,14 @@ impl Style {
 pub fn print_status(topo: &Topology, g: &Globals) {
     let st = Style::new();
     println!(
-        "{:<4} {:<5} {:>4} {:<3} {:<9} {:<7} {:>9} {:>17}  {:<11} {}",
-        "CPU", "TYPE", "CORE", "THR", "L2", "STATE", "CUR", "MIN-MAX", "GOVERNOR", "EPP"
+        "{:<4} {:<5} {:>4} {:<3} {:<9} {:<7} {:>9} {:>17}  {:<11} EPP",
+        "CPU", "TYPE", "CORE", "THR", "L2", "STATE", "CUR", "MIN-MAX", "GOVERNOR"
     );
     for c in &topo.cpus {
         let thr = c.siblings.iter().position(|s| s == c.id).map(|i| format!("T{i}")).unwrap_or_else(|| "?".into());
         let core = if c.topology_known { c.core_id.to_string() } else { "?".into() };
+        // Without topology the type is a guess too; don't present it as fact.
+        let kind = if c.topology_known { c.kind.to_string() } else { "?".into() };
         let l2 = c.l2_group.iter().next().map(|f| format!("#{f}")).unwrap_or_default();
         let state = match (c.online, c.hotpluggable) {
             (true, true) => st.paint("32", "online "),
@@ -38,7 +40,7 @@ pub fn print_status(topo: &Topology, g: &Globals) {
         let line = format!(
             "{:<4} {:<5} {:>4} {:<3} {:<9} {} {:>9} {:>17}  {:<11} {}",
             c.id,
-            c.kind.to_string(),
+            kind,
             core,
             thr,
             l2,
